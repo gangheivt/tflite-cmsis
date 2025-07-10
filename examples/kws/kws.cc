@@ -56,6 +56,7 @@ using AudioPreprocessorOpResolver = tflite::MicroMutableOpResolver<19>;
 
 static tflite::MicroInterpreter * g_interpreter;
 static MicroSpeechOpResolver op_resolver;
+static int g_prediction_index;
 
 
 TfLiteStatus RegisterOps(MicroSpeechOpResolver& op_resolver) {
@@ -128,7 +129,7 @@ TfLiteStatus LoadMicroSpeechModel(    )
 
     if (kTfLiteOk!=r)
         MicroPrintf("Could not Register OPs: %d.", r);
-    else {    
+    else {
         tflite::MicroInterpreter *interpreter=new tflite::MicroInterpreter(model, op_resolver, g_arena, kArenaSize);
         r=interpreter->AllocateTensors();
         if (kTfLiteOk!=r) {
@@ -139,7 +140,7 @@ TfLiteStatus LoadMicroSpeechModel(    )
             g_interpreter=interpreter;
         }
     }
-    
+
     return r;
 }
 
@@ -154,8 +155,10 @@ TfLiteStatus UnloadModel(    )
 
 const char* PerformInference(const int16_t* audio_data, const size_t audio_data_size)
 {
+    g_prediction_index = -1;
     TfLiteTensor* input = g_interpreter->input(0);
     TfLiteTensor* output = g_interpreter->output(0);
+    RT_ASSERT(output);
     TfLiteStatus r;
 
     Features m_features;
@@ -165,7 +168,7 @@ const char* PerformInference(const int16_t* audio_data, const size_t audio_data_
     int output_zero_point = output->params.zero_point;
     std::copy_n(&m_features[0][0], kFeatureElementCount,
               tflite::GetTensorData<int8_t>(input));
-    
+
     r=g_interpreter->Invoke();
     if (kTfLiteOk!=r) {
         MicroPrintf("Invoke Model failed: %d", r);
@@ -181,7 +184,7 @@ const char* PerformInference(const int16_t* audio_data, const size_t audio_data_
 #if 0
             MicroPrintf("  %.4f %s", static_cast<double>(category_predictions[i]),
                         kCategoryLabels[i]);
-#endif            
+#endif
         }
         int prediction_index =
              std::distance(std::begin(category_predictions),
@@ -189,6 +192,7 @@ const char* PerformInference(const int16_t* audio_data, const size_t audio_data_
                                              std::end(category_predictions)));
         if (category_predictions[prediction_index] < kFeatureThreshold)
             prediction_index=kLabelUnknownIdx;
+        g_prediction_index = prediction_index;
         return kCategoryLabels[prediction_index];
     }
 }
@@ -197,7 +201,7 @@ TfLiteStatus PerformInferenceAndCheck(
     const int16_t* audio_data, const size_t audio_data_size, const char* expected_label)
 {
     const char * label;
-    
+
     MicroPrintf("MicroSpeech category predictions for <%s>", expected_label);
     label=PerformInference(audio_data, audio_data_size);
     TF_LITE_MICRO_EXPECT_STRING_EQ(expected_label,label);
@@ -222,15 +226,27 @@ TfLiteStatus TestAudioSample(const char* label, const int16_t* audio_data,
 extern "C" void mic_gain_decrease(int8_t db);
 
 
-#define MIC_1000MS_DATA_BYTES       (16000 * 2)
+#define MIC_1000MS_DATA_BYTES                       (16000 * 2)
+#define MAX_BYTES_APPENDED_WHILE_INFERENCE          (320 * 100)  //perform inference 1000ms data cost < 100ms
+#define MOVE_WINDOWN_BYTES                          (MAX_BYTES_APPENDED_WHILE_INFERENCE/2) // move 50ms data
+typedef enum VadState
+{
+    VAD_STATE_IDLE = 0,
+    VAD_STATE_START = 1,
+    VAD_STATE_GOT_VAD = 2,
+    VAD_STATE_INFERENCE = 3,
+    VAD_STATE_MOVE_WINDOW = 4
+} VadStates;
+
+static int test_using_mic = 1;
 
 typedef struct
 {
     audio_client_t  client;
     VadInst         *vad;
-    uint8_t         data[MIC_1000MS_DATA_BYTES + 320];
+    uint8_t         data[MIC_1000MS_DATA_BYTES + MAX_BYTES_APPENDED_WHILE_INFERENCE];
     uint32_t        offset;
-    int             is_vad_started;
+    VadStates       vad_state;
     rt_event_t      event;
 } kws_handle_t;
 
@@ -242,22 +258,15 @@ static int kws_record_callback(audio_server_callback_cmt_t cmd, void *callback_u
     {
         audio_server_coming_data_t *p = (audio_server_coming_data_t *)reserved;
         RT_ASSERT(p->data_len == 320);
-        if (thiz->is_vad_started == 1)
+
+        if (thiz->vad_state == VAD_STATE_IDLE)
         {
-            memcpy(&thiz->data[thiz->offset], p->data, p->data_len);
-            thiz->offset += p->data_len;
-            if (thiz->offset >= MIC_1000MS_DATA_BYTES)
-            {
-                thiz->is_vad_started = 2;
-                thiz->offset = 0;
-                rt_event_send(thiz->event, 1);
-            }
+            memcpy(&thiz->data[0], p->data, p->data_len);
+            thiz->offset = p->data_len;
+            thiz->vad_state = VAD_STATE_START;
+            return 0;
         }
-        else if (thiz->is_vad_started == 2)
-        {
-            //kws is busy
-        }
-        else
+        if (thiz->vad_state == VAD_STATE_START)
         {
             int ret;
             ret = WebRtcVad_Process(thiz->vad, 16000, (int16_t*)p->data, p->data_len/2);
@@ -266,16 +275,61 @@ static int kws_record_callback(audio_server_callback_cmt_t cmd, void *callback_u
                 MicroPrintf("voice start");
                 memcpy(&thiz->data[thiz->offset], p->data, p->data_len);
                 thiz->offset += p->data_len;
-                thiz->is_vad_started = 1;
+                thiz->vad_state = VAD_STATE_GOT_VAD;
             }
             else
             {
-                //reserved 100ms data before vad detected
-                memcpy(&thiz->data[0], &thiz->data[320], 320 * 9);
-                memcpy(&thiz->data[320 * 9], p->data, 320);
-                thiz->offset = 320 * 10;
+                //reserved 50ms data before vad detected
+                memcpy(&thiz->data[0], &thiz->data[320], 320 * 4);
+                memcpy(&thiz->data[320 * 4], p->data, 320);
+                thiz->offset = 320 * 5;
             }
+            return 0;
         }
+
+        if (thiz->vad_state == VAD_STATE_GOT_VAD)
+        {
+            memcpy(&thiz->data[thiz->offset], p->data, p->data_len);
+            thiz->offset += p->data_len;
+            if (thiz->offset >= MIC_1000MS_DATA_BYTES)
+            {
+                thiz->vad_state = VAD_STATE_INFERENCE;
+                rt_event_send(thiz->event, 1);
+            }
+            return 0;
+        }
+
+        if (thiz->vad_state == VAD_STATE_MOVE_WINDOW)
+        {
+            if (thiz->offset + p->data_len <= sizeof(thiz->data))
+            {
+                memcpy(&thiz->data[thiz->offset], p->data, p->data_len);
+                thiz->offset += p->data_len;
+            }
+            if (thiz->offset >= MIC_1000MS_DATA_BYTES + MOVE_WINDOWN_BYTES)
+            {
+                memcpy(&thiz->data[0], &thiz->data[MOVE_WINDOWN_BYTES], MIC_1000MS_DATA_BYTES);
+                thiz->offset = MIC_1000MS_DATA_BYTES;
+                thiz->vad_state = VAD_STATE_INFERENCE;
+                rt_event_send(thiz->event, 1);
+            }
+            return 0;
+        }
+
+        if (thiz->vad_state == VAD_STATE_INFERENCE)
+        {
+            if (thiz->offset + p->data_len <= sizeof(thiz->data))
+            {
+                memcpy(&thiz->data[thiz->offset], p->data, p->data_len);
+                thiz->offset += p->data_len;
+            }
+            else
+            {
+                MicroPrintf("drop mic data while inference");
+            }
+            return 0;
+        }
+
     }
 
     return 0;
@@ -284,6 +338,9 @@ static kws_handle_t * kws_open()
 {
     int ret;
     RT_ASSERT(!thiz);
+
+    LoadMicroSpeechModel();
+
     thiz = (kws_handle_t *)rt_malloc(sizeof(kws_handle_t));
     RT_ASSERT(thiz);
     memset(thiz, 0 , sizeof(kws_handle_t));
@@ -310,7 +367,7 @@ static kws_handle_t * kws_open()
     thiz->client = audio_open(AUDIO_TYPE_LOCAL_RECORD, AUDIO_RX, &pa, kws_record_callback, (void *)NULL);
     RT_ASSERT(thiz->client);
     MicroPrintf("kws_open done");
-    
+
     mic_gain_decrease(4);
     return thiz;
 }
@@ -326,31 +383,59 @@ static void kws_close()
     rt_event_delete(thiz->event);
     rt_free(thiz);
     thiz = NULL;
+    UnloadModel();
 }
 
-extern "C" int tf_main(int argc, char* argv[]) 
+extern "C" int tf_main(int argc, char* argv[])
 {
-    LoadMicroSpeechModel();
 
     kws_open();
     MicroPrintf("please speaking\n");
-    while (1)
+    while (test_using_mic)
     {
         const char * label;
         rt_uint32_t evt = 0;
         rt_event_recv(thiz->event, 1, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &evt);
-        label=PerformInference((const int16_t*)&thiz->data[0], MIC_1000MS_DATA_BYTES / 2);
-        if (strcmp(label,"unknown")!=0 && strcmp(label,"silence")!=0 )
+        label = PerformInference((const int16_t*)&thiz->data[0], MIC_1000MS_DATA_BYTES / 2);
+        if (strcmp(label,"unknown")!=0 && strcmp(label,"silence")!=0)
             MicroPrintf("Result:%s", label);
-        memset(&thiz->data[0], 0, MIC_1000MS_DATA_BYTES);
-        thiz->is_vad_started = 0;
+
+        if (g_prediction_index != kLabelUnknownIdx)
+        {
+            MicroPrintf("match index=%d", g_prediction_index);
+            memset(&thiz->data[0], 0, sizeof(thiz->data));
+            thiz->vad_state = VAD_STATE_IDLE;
+        }
+        else
+        {
+            MicroPrintf("no match, move voice window");
+#if 1
+            thiz->vad_state = VAD_STATE_MOVE_WINDOW;
+#else
+            thiz->vad_state = VAD_STATE_IDLE;
+#endif
+        }
     }
+
     kws_close();
-}    
+    return 0;
+}
+
+int kws_mic(int argc, char **argv)
+{
+    test_using_mic = !test_using_mic;
+    return 0;
+}
+
+MSH_CMD_EXPORT_ALIAS(kws_mic, kws_mic, kws_mic);
 
 #else
 
 TF_LITE_MICRO_TESTS_BEGIN
+
+TF_LITE_MICRO_TEST(Init) {
+  LoadMicroSpeechModel();
+}
 
 TF_LITE_MICRO_TEST(NoTest) {
   TestAudioSample("no", g_no_1000ms_audio_data, g_no_1000ms_audio_data_size);
