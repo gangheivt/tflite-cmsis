@@ -30,6 +30,120 @@ limitations under the License.
 #include "mem_section.h"
 #include "MFCC.hpp"
 
+// LED control includes
+#ifdef KWS_MIC_SUPPORT
+extern "C" {
+#include "bf0_hal.h"
+#include "drivers/rt_drv_pwm.h"
+#include "drv_io.h"
+#include "rtthread.h"
+}
+
+#define RGBLED_NAME "rgbled"
+#define LED_GREEN_COLOR 0x000f00
+#define LED_RED_COLOR   0x0f0000
+#define LED_OFF_COLOR   0x000000
+
+static struct rt_device *rgbled_device = NULL;
+
+// LED color control function
+static void kws_led_set_color(uint32_t color)
+{
+    if (rgbled_device)
+    {
+        struct rt_rgbled_configuration configuration;
+        configuration.color_rgb = color;
+        int ret = rt_device_control(rgbled_device, PWM_CMD_SET_COLOR, &configuration);
+        if (ret != RT_EOK)
+        {
+            MicroPrintf("LED control failed with error: %d", ret);
+        }
+    }
+    else
+    {
+        MicroPrintf("WARNING: rgbled_device is NULL, cannot set color 0x%06x", color);
+    }
+}
+
+// LED initialization function
+static void kws_led_init()
+{
+    MicroPrintf("Starting LED initialization...");
+    
+    // 配置外设LDO电源（仅黄山派开发板需要）
+#ifdef BSP_USING_BOARD_SF32LB52_LCHSPI_ULP
+    HAL_PMU_ConfigPeriLdo(PMU_PERI_LDO3_3V3, true, true);
+    MicroPrintf("LDO power configured for SF32LB52-LCHSPI-ULP board");
+#else
+    MicroPrintf("Skip LDO configuration (not SF32LB52-LCHSPI-ULP board)");
+#endif
+    
+    // 配置PA32引脚为PWM2通道1（按照ws2812示例的配置）
+    HAL_PIN_Set(PAD_PA32, GPTIM2_CH1, PIN_NOPULL, 1);
+    MicroPrintf("PIN PA32 configured for PWM2_CH1");
+    
+    // 等待设备稳定
+    rt_thread_mdelay(100);
+    
+    // 查找RGB LED设备
+    rgbled_device = rt_device_find(RGBLED_NAME);
+    if (!rgbled_device)
+    {
+        MicroPrintf("ERROR: LED device '%s' not found!", RGBLED_NAME);
+        MicroPrintf("Please check RGB LED configuration in proj.conf");
+    }
+    else
+    {
+        MicroPrintf("LED device '%s' found successfully", RGBLED_NAME);
+        // 测试LED功能 - 启动时闪烁蓝灯表示初始化成功
+        kws_led_set_color(0x00000f); // 蓝色
+        rt_thread_mdelay(500);
+        kws_led_set_color(LED_OFF_COLOR);
+        rt_thread_mdelay(500);
+        kws_led_set_color(0x00000f); // 蓝色
+        rt_thread_mdelay(500);
+        kws_led_set_color(LED_OFF_COLOR);
+        MicroPrintf("LED initialization test completed");
+    }
+}
+
+// LED control based on recognition result
+static void kws_led_control(const char* label)
+{
+    if (!rgbled_device) return;
+    
+    // Check if it's one of the 12 valid keywords (excluding "silence" and "unknown")
+    if (strcmp(label, "yes") == 0 || strcmp(label, "no") == 0 ||
+        strcmp(label, "up") == 0 || strcmp(label, "down") == 0 ||
+        strcmp(label, "left") == 0 || strcmp(label, "right") == 0 ||
+        strcmp(label, "on") == 0 || strcmp(label, "off") == 0 ||
+        strcmp(label, "stop") == 0 || strcmp(label, "go") == 0)
+    {
+        // Valid keyword detected - green light
+        kws_led_set_color(LED_GREEN_COLOR);
+        MicroPrintf("LED: Green (valid keyword: %s)", label);
+    }
+    else if (strcmp(label, "unknown") == 0)
+    {
+        // Unknown word detected - red light
+        kws_led_set_color(LED_RED_COLOR);
+        MicroPrintf("LED: Red (unknown word)");
+    }
+    else if (strcmp(label, "silence") == 0)
+    {
+        // Silence detected - turn off LED
+        kws_led_set_color(LED_OFF_COLOR);
+        // Don't print for silence to reduce noise
+    }
+    else
+    {
+        // Error case - turn off LED
+        kws_led_set_color(LED_OFF_COLOR);
+        MicroPrintf("LED: Off (error case: %s)", label);
+    }
+}
+#endif
+
 extern "C" int tf_main(int argc, char * argv [ ]);
 #define main tf_main
 #include "tensorflow/lite/micro/testing/micro_test.h"
@@ -333,6 +447,9 @@ extern "C" int tf_main(int argc, char* argv[])
 {
     LoadMicroSpeechModel();
 
+    // Initialize LED for keyword indication
+    kws_led_init();
+
     kws_open();
     MicroPrintf("please speaking\n");
     while (1)
@@ -341,6 +458,10 @@ extern "C" int tf_main(int argc, char* argv[])
         rt_uint32_t evt = 0;
         rt_event_recv(thiz->event, 1, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &evt);
         label=PerformInference((const int16_t*)&thiz->data[0], MIC_1000MS_DATA_BYTES / 2);
+        
+        // Control LED based on recognition result
+        kws_led_control(label);
+        
         if (strcmp(label,"unknown")!=0 && strcmp(label,"silence")!=0 )
             MicroPrintf("Result:%s", label);
         memset(&thiz->data[0], 0, MIC_1000MS_DATA_BYTES);
